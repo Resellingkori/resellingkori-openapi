@@ -1,0 +1,901 @@
+openapi: 3.1.0
+
+info:
+  title: ResellingKori Partner API
+  version: "3.1"
+  summary: Sell ResellingKori products from your own website or app, at your own prices.
+  description: |
+    You sell to your customer at **your** price. ResellingKori packs and ships the parcel, the courier collects the
+    cash you tell it to collect, and you keep the difference between your selling price and the ResellingKori price.
+
+    This is the same API the ResellingKori WooCommerce Connector plugin uses. Everything a WooCommerce reseller can
+    do, your site can do too.
+
+    **Revision 3.1** · signing **RK2** · order schema **2** · currency **BDT** (the only currency).
+
+    ## Authentication (every request)
+
+    Four headers, no cookies, no bearer token. The secret is never sent.
+
+    | Header | Value |
+    |---|---|
+    | `X-RK-Key` | your Key ID (`rkk_…`) |
+    | `X-RK-Timestamp` | current Unix time in seconds (the server accepts ±300 s) |
+    | `X-RK-Nonce` | 16–64 characters `A–Z a–z 0–9 _ -`, new for every request (use 32 random hex characters) |
+    | `X-RK-Signature` | lower-case hex HMAC-SHA256 of the canonical string below, keyed with your secret (`rks_…`) |
+
+    ```
+    canonical = "RK2" LF timestamp LF nonce LF METHOD LF route LF query LF sha256_hex(body)
+    ```
+
+    * `route` – the path **without** `/wp-json` and without `?…`, for example `/rk/v1/orders` or `/rk/v1/products/5120`.
+    * `query` – all query parameters sorted by name, names and values RFC 3986-encoded (space is `%20`, never `+`),
+      joined as `a=1&b=2`; the empty string when there is none.
+    * `body` – the exact bytes you send (empty for GET). Serialise once, hash, send the same bytes.
+    * No trailing line feed.
+
+    Test vectors (secret `rks_test_secret`, timestamp `1700000000`, nonce `0123456789abcdef0123456789abcdef`):
+
+    | Request | Signature |
+    |---|---|
+    | `GET /rk/v1/products/search?q=awei y526&per_page=20` | `c69632110d86a75fc480e6fd8b319ae3d96336600cfc5a3498dcd90e0eb49620` |
+    | `POST /rk/v1/orders` with body `{"external_order_id":"1058"}` | `efa3d6bdd0c94c34ba44106831ebc83b17a4d84ec0ef34c74b27cf46e1482779` |
+
+    The ready clients in this kit (PHP, Node.js, Python, Postman) do all of this for you.
+
+    ## Permissions
+
+    Each key carries a list of permissions: `catalog:read`, `orders:read`, `orders:write`, `webhooks:manage`.
+    A request without the permission it needs is answered `403 rkapi_scope_denied` (`data.required`, `data.granted`).
+    `GET /ping` and the reading half of `POST /connection` need none.
+
+    ## Money
+
+    Amounts are strings in BDT with two decimals (`"1190.00"`); arithmetic on the server is exact (integer paisa).
+
+    ## Errors
+
+    Every error is `{ "code": "rkapi_…", "message": "…", "data": { "status": 422, … } }`. Branch on `code`.
+    Retry the **same** request (same body, same `external_order_id`, a new nonce) only after network errors, `5xx`,
+    `408`, `425`, `429`, `rkapi_in_progress` and `rkapi_busy`. Every other `4xx` is final.
+
+    ## Idempotency
+
+    `POST /orders` is idempotent on `external_order_id`. After a timeout or a `5xx`, call `GET /orders/lookup` first;
+    if the order is not found, send the identical body again. The official clients do exactly this in `createOrder`.
+  contact:
+    name: ResellingKori support
+    url: https://resellingkori.com
+  x-api-revision: "3.1"
+  x-signing: RK2
+
+servers:
+  - url: https://resellingkori.com/wp-json/rk/v1
+    description: ResellingKori production (the route you sign is the path after /wp-json, for example /rk/v1/orders)
+
+tags:
+  - name: Connection
+    description: Check your credentials, permissions and limits; register your webhook.
+  - name: Catalogue
+    description: Products and categories (permission `catalog:read`).
+  - name: Orders
+    description: Check, place, follow and cancel orders.
+
+security:
+  - rkKey: []
+    rkTimestamp: []
+    rkNonce: []
+    rkSignature: []
+
+paths:
+  /ping:
+    get:
+      tags: [Connection]
+      operationId: ping
+      summary: Who am I?
+      description: |
+        Returns your store, key, sales agent, permissions and limits. Call it first: `200` with `"ok": true` means your
+        signing is right. `401 rkapi_auth_invalid` means the signature does not match (check the route without
+        `/wp-json`, the query encoding and that the body you hash is the body you send).
+      x-required-permission: none
+      responses:
+        "200":
+          description: Your connection.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Ping" }
+        default: { $ref: "#/components/responses/Error" }
+
+  /connection:
+    post:
+      tags: [Connection]
+      operationId: connection
+      summary: Register or remove your webhook address
+      description: |
+        Same answer as `/ping`, plus `agent_match` and `callback_result`. Registering needs the `webhooks:manage`
+        permission. ResellingKori sends a signed `callback.verify` event to the address and expects
+        `{"proof": HMAC_SHA256_hex(secret, "RK2-CALLBACK\n" + challenge)}` with HTTP 200.
+        At most 12 registrations per store per hour. `remove_callback: true` switches webhooks off (poll `GET /orders` instead).
+      x-required-permission: "webhooks:manage (only to change the webhook)"
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/ConnectionRequest" }
+      responses:
+        "200":
+          description: Your connection and the result of the webhook change.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ConnectionResult" }
+        default: { $ref: "#/components/responses/Error" }
+
+  /products:
+    get:
+      tags: [Catalogue]
+      operationId: listProducts
+      summary: The whole catalogue (paged), for import and incremental sync
+      description: |
+        Only published `simple` and `variable` products, ordered by last modification then id, oldest first.
+        **Incremental sync:** keep the largest `date_modified` you received and call again with `updated_after` set to it;
+        page until `page = total_pages`. Receiving a product you already have is normal: update it by `id`.
+      x-required-permission: "catalog:read"
+      parameters:
+        - { name: page, in: query, schema: { type: integer, minimum: 1, default: 1 } }
+        - { name: per_page, in: query, description: "Products per page (1–100).",  schema: { type: integer, minimum: 1, maximum: 100, default: 50 } }
+        - name: updated_after
+          in: query
+          description: Unix seconds, or ISO 8601 (`2026-11-01T00:00:00Z`; without an offset the time is UTC). Only products changed at or after this time.
+          schema: { type: string }
+        - { name: category, in: query, description: "Category slug (see `GET /categories`).", schema: { type: string } }
+        - { name: in_stock, in: query, description: "`1` = only products in stock or on back-order.", schema: { type: string, enum: ["1"] } }
+        - { name: sku, in: query, description: "Part of an SKU.", schema: { type: string } }
+        - { name: include, in: query, description: "`description` adds the full HTML description.", schema: { type: string, enum: [description] } }
+      responses:
+        "200":
+          description: One page of products.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ProductPage" }
+        default: { $ref: "#/components/responses/Error" }
+
+  /categories:
+    get:
+      tags: [Catalogue]
+      operationId: listCategories
+      summary: Product categories
+      x-required-permission: "catalog:read"
+      parameters:
+        - { name: hide_empty, in: query, description: "`1` leaves out categories without published products.", schema: { type: string, enum: ["1"] } }
+      responses:
+        "200":
+          description: Up to 1000 categories, by name.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/CategoryList" }
+        default: { $ref: "#/components/responses/Error" }
+
+  /products/search:
+    get:
+      tags: [Catalogue]
+      operationId: searchProducts
+      summary: Keyword search
+      description: |
+        Words shorter than 2 characters are dropped; at most 8 words are used. A product matches if its title contains any
+        of the words (`SH-309` also matches `SH309`); words that contain a digit are also matched against product and
+        variation SKUs. Ranked by the number of matching words, then by title. No usable word: `400 rkapi_query_short`.
+      x-required-permission: "catalog:read"
+      parameters:
+        - { name: q, in: query, required: true, schema: { type: string } }
+        - { name: per_page, in: query, description: "1–30.", schema: { type: integer, minimum: 1, maximum: 30, default: 20 } }
+        - { $ref: "#/components/parameters/IncludeDetails" }
+      responses:
+        "200":
+          description: Matching products.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/SearchResult" }
+        default: { $ref: "#/components/responses/Error" }
+
+  /products/by-sku:
+    get:
+      tags: [Catalogue]
+      operationId: productsBySku
+      summary: Look up products by SKU
+      description: Up to 50 comma-separated SKUs, exact match, case-insensitive; products and variations. When a SKU belongs to a variation, `matched_variation_id` names it.
+      x-required-permission: "catalog:read"
+      parameters:
+        - { name: skus, in: query, required: true, description: "Comma-separated SKUs (at most 50).", schema: { type: string } }
+        - { $ref: "#/components/parameters/IncludeDetails" }
+      responses:
+        "200":
+          description: Matches by SKU and the SKUs that were not found.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/SkuResult" }
+        default: { $ref: "#/components/responses/Error" }
+
+  /products/{id}:
+    get:
+      tags: [Catalogue]
+      operationId: getProduct
+      summary: One product
+      description: "A variation id resolves to its parent product (and sets `matched_variation_id`). Unpublished or missing: `404 rkapi_product_not_found`."
+      x-required-permission: "catalog:read"
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: integer, minimum: 1 } }
+        - { $ref: "#/components/parameters/IncludeDetails" }
+      responses:
+        "200":
+          description: The product.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [item]
+                properties:
+                  item: { $ref: "#/components/schemas/Product" }
+        default: { $ref: "#/components/responses/Error" }
+
+  /orders/validate:
+    post:
+      tags: [Orders]
+      operationId: validateOrder
+      summary: Check an order without placing it (dry run)
+      description: |
+        Same body and the same checks as `POST /orders` (catalogue, variation, price floor, price guard, stock, amounts,
+        limits, your sales agent), but **nothing is created or reserved**. Errors are the same as for `POST /orders`.
+        Stock can still run out between validate and create: only `POST /orders` reserves it.
+      x-required-permission: "orders:write"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/OrderRequest" }
+      responses:
+        "200":
+          description: The order would be accepted now.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ValidateResult" }
+        default: { $ref: "#/components/responses/Error" }
+
+  /orders:
+    post:
+      tags: [Orders]
+      operationId: createOrder
+      summary: Place an order at your selling price (exactly once)
+      description: |
+        Idempotent on `external_order_id`. `201` = created and stock reserved. `200` with `duplicate: true` = you already
+        sent exactly this order; the original is returned. `409 rkapi_order_conflict` = this reference was used with
+        different content. After a timeout or `5xx` do **not** invent a new reference: look the order up
+        (`GET /orders/lookup`), and if it answers `404 rkapi_order_not_found` send the identical body again.
+        There is no amendment: cancel and send a new order under a new reference.
+      x-required-permission: "orders:write"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/OrderRequest" }
+      responses:
+        "201":
+          description: Created.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/CreateResult" }
+        "200":
+          description: "Already created with exactly this content (`duplicate: true`)."
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/CreateResult" }
+        default: { $ref: "#/components/responses/Error" }
+    get:
+      tags: [Orders]
+      operationId: listOrders
+      summary: Your orders (for reconciliation and polling)
+      description: |
+        Newest change first, or oldest change first when `updated_after` is given (`order=asc|desc` overrides).
+        Poll every 5–15 minutes with `updated_after` = the `server_time` of your previous poll.
+        `gone` lists external ids of orders that were deleted on ResellingKori's side.
+      x-required-permission: "orders:read"
+      parameters:
+        - { name: page, in: query, schema: { type: integer, minimum: 1, default: 1 } }
+        - { name: per_page, in: query, description: "1–100.", schema: { type: integer, minimum: 1, maximum: 100, default: 20 } }
+        - { name: status, in: query, schema: { $ref: "#/components/schemas/OrderStatus" } }
+        - name: updated_after
+          in: query
+          description: Unix seconds or ISO 8601 (UTC without an offset). Compared with the order's last change.
+          schema: { type: string }
+        - { name: order, in: query, schema: { type: string, enum: [asc, desc] } }
+      responses:
+        "200":
+          description: One page of orders.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/OrderPage" }
+        default: { $ref: "#/components/responses/Error" }
+
+  /orders/lookup:
+    get:
+      tags: [Orders]
+      operationId: lookupOrder
+      summary: Find your order by your own reference
+      description: |
+        `{ "order": Order, "state": "created | cancelled" }`; `{ "order": null, "state": "creating" }` while a creation is in
+        flight (wait a few seconds and look again); `404 rkapi_order_not_found` if there is none, which means sending the same
+        request again is safe.
+      x-required-permission: "orders:read"
+      parameters:
+        - { name: external_order_id, in: query, required: true, schema: { $ref: "#/components/schemas/ExternalOrderId" } }
+      responses:
+        "200":
+          description: The order, or the in-flight marker.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/LookupResult" }
+        default: { $ref: "#/components/responses/Error" }
+
+  /orders/status:
+    get:
+      tags: [Orders]
+      operationId: orderStatuses
+      summary: Status of several orders by ResellingKori id
+      x-required-permission: "orders:read"
+      parameters:
+        - { name: ids, in: query, required: true, description: "Comma-separated ResellingKori order ids (`Order.id`), at most 100.", schema: { type: string } }
+      responses:
+        "200":
+          description: The orders and the ids that do not belong to your store.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/StatusResult" }
+        default: { $ref: "#/components/responses/Error" }
+
+  /orders/{id}:
+    get:
+      tags: [Orders]
+      operationId: getOrder
+      summary: One order by ResellingKori id
+      description: Orders of other stores are indistinguishable from missing ones (`404 rkapi_order_not_found`).
+      x-required-permission: "orders:read"
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: integer, minimum: 1 } }
+      responses:
+        "200":
+          description: The order.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [order]
+                properties:
+                  order: { $ref: "#/components/schemas/Order" }
+        default: { $ref: "#/components/responses/Error" }
+
+  /orders/cancel:
+    post:
+      tags: [Orders]
+      operationId: cancelOrder
+      summary: Cancel an order that has not been processed yet
+      description: |
+        Possible while `order.cancellable` is true (not yet processed, no tracking number). Cancelling twice is harmless
+        (`already_cancelled: true`). Otherwise `409 rkapi_not_cancellable`. Stock returns to ResellingKori.
+      x-required-permission: "orders:write"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/CancelRequest" }
+      responses:
+        "200":
+          description: The cancelled order.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/CancelResult" }
+        default: { $ref: "#/components/responses/Error" }
+
+webhooks:
+  orderEvent:
+    post:
+      tags: [Orders]
+      operationId: webhookOrderEvent
+      summary: Order changed (sent by ResellingKori to the address you registered)
+      description: |
+        Signed like an API request, but with the **literal route `/rkc/v1/webhook`** (whatever your real path is), an empty
+        query, and the extra header `X-RK-Event-Id`. Verify the signature and the ±300 s timestamp, remember nonces and event
+        ids for at least 10 minutes and ignore repeats, ignore an event whose `sequence` is lower than the one you already
+        applied for that order, answer `2xx` within 10 seconds. Network errors, `5xx`, `408`, `425` and `429` are retried
+        after 1, 3, 9, 27 and 81 minutes; other `4xx` are not.
+
+        The first event is `callback.verify`: answer `200 {"proof": HMAC_SHA256_hex(secret, "RK2-CALLBACK\n" + challenge)}`.
+        Webhooks never contain customer details.
+      parameters:
+        - { name: X-RK-Key, in: header, required: true, schema: { type: string } }
+        - { name: X-RK-Timestamp, in: header, required: true, schema: { type: string } }
+        - { name: X-RK-Nonce, in: header, required: true, schema: { type: string } }
+        - { name: X-RK-Signature, in: header, required: true, schema: { type: string } }
+        - { name: X-RK-Event-Id, in: header, required: true, schema: { type: string } }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/WebhookEvent" }
+      responses:
+        "200":
+          description: "Received. For `callback.verify` the body must be `{\"proof\": \"…\"}`."
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  proof: { type: string, description: "HMAC_SHA256_hex(secret, \"RK2-CALLBACK\\n\" + challenge) – only for callback.verify." }
+
+components:
+  securitySchemes:
+    rkKey:
+      type: apiKey
+      in: header
+      name: X-RK-Key
+      description: Your Key ID (`rkk_…`). Not secret.
+    rkTimestamp:
+      type: apiKey
+      in: header
+      name: X-RK-Timestamp
+      description: Current Unix time in seconds (±300 s).
+    rkNonce:
+      type: apiKey
+      in: header
+      name: X-RK-Nonce
+      description: New random value for every request (32 hex characters).
+    rkSignature:
+      type: apiKey
+      in: header
+      name: X-RK-Signature
+      description: Lower-case hex HMAC-SHA256 of the RK2 canonical string, keyed with your secret. See the API description.
+
+  parameters:
+    IncludeDetails:
+      name: include
+      in: query
+      description: "`details` adds categories, images, weight, dimensions, short description and modification date; `details,description` also the HTML description. (`GET /products` always includes the details.)"
+      schema: { type: string, enum: [details, "details,description", description] }
+
+  responses:
+    Error:
+      description: |
+        An error. Branch on `code`. Common codes: `rkapi_auth_missing`/`rkapi_auth_invalid` (401), `rkapi_auth_expired` (401, `data.server_time`),
+        `rkapi_auth_replay` (401), `rkapi_key_revoked` (401), `rkapi_store_disabled` (403), `rkapi_scope_denied` (403), `rkapi_ip_denied` (403),
+        `rkapi_locked`/`rkapi_rate_limited` (429, `Retry-After`), `rkapi_validation`/`rkapi_amount_invalid`/`rkapi_items_invalid` (422),
+        `rkapi_price_changed`/`rkapi_out_of_stock`/`rkapi_order_conflict`/`rkapi_in_progress`/`rkapi_not_cancellable` (409),
+        `rkapi_order_not_found`/`rkapi_product_not_found` (404), `rkapi_busy` (503), `rkapi_create_failed` (500).
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+
+  schemas:
+    Money:
+      type: string
+      pattern: '^[0-9]+(\.[0-9]{1,2})?$'
+      description: Amount in BDT with two decimals.
+      examples: ["1190.00"]
+
+    ExternalOrderId:
+      type: string
+      minLength: 1
+      maxLength: 64
+      pattern: '^[A-Za-z0-9._:-]+$'
+      description: Your own order reference. Unique per order, forever.
+      examples: ["WEB-10058"]
+
+    OrderStatus:
+      type: string
+      enum: [pending, processing, on_hold, shipped, delivered, cancelled, returned]
+      description: "`delivered`, `cancelled` and `returned` are final."
+
+    Error:
+      type: object
+      required: [code, message]
+      properties:
+        code: { type: string, examples: [rkapi_validation] }
+        message: { type: string }
+        data:
+          type: object
+          properties:
+            status: { type: integer }
+            fields:
+              type: array
+              items:
+                type: object
+                properties:
+                  field: { type: string }
+                  code: { type: string }
+                  message: { type: string }
+              description: Validation problems (422).
+            required: { type: [string, "null"], description: "Permission needed (`rkapi_scope_denied`)." }
+            granted: { type: array, items: { type: string } }
+            server_time: { type: integer, description: "On `rkapi_auth_expired`: use it to correct your clock." }
+            retry_after: { type: integer }
+            ip: { type: string, description: "On `rkapi_ip_denied`: the address the request came from." }
+            changes: { type: array, items: { type: object }, description: "On `rkapi_price_changed`." }
+            shortages: { type: array, items: { type: object }, description: "On `rkapi_out_of_stock`: { label, requested, available }." }
+          additionalProperties: true
+      additionalProperties: true
+
+    Ping:
+      type: object
+      required: [ok, api_version, api_revision, signing, server_time, currency, store, agent, callback, limits]
+      properties:
+        ok: { type: boolean }
+        api_version: { type: string, examples: ["3"] }
+        api_revision: { type: string, examples: ["3.1"] }
+        features: { type: array, items: { type: string } }
+        signing: { type: string, examples: [RK2] }
+        server_time: { type: integer }
+        currency: { type: string, examples: [BDT] }
+        site_name: { type: string }
+        store:
+          type: object
+          required: [id, name, key_id, key_status, platform, scopes, ip_restricted]
+          properties:
+            id: { type: string }
+            name: { type: string }
+            url: { type: string }
+            key_id: { type: string }
+            key_status: { type: string, enum: [active, grace] }
+            key_expires_at: { type: [string, "null"] }
+            platform: { type: string, enum: [woocommerce, custom, shopify, other] }
+            scopes:
+              type: array
+              items: { type: string, enum: [catalog:read, orders:read, orders:write, webhooks:manage] }
+            ip_restricted: { type: boolean }
+        agent:
+          type: object
+          properties:
+            name: { type: string }
+            email_hint: { type: string, description: Masked; the full address is never returned. }
+            valid: { type: boolean }
+        callback:
+          type: object
+          properties:
+            state: { type: string, enum: [none, pending, verified] }
+            url: { type: string }
+        limits:
+          type: object
+          properties:
+            max_lines: { type: integer }
+            max_order_amount: { $ref: "#/components/schemas/Money" }
+            max_cod_amount: { $ref: "#/components/schemas/Money" }
+            max_delivery_charge: { $ref: "#/components/schemas/Money" }
+            max_line_qty: { type: integer }
+            requests_per_minute: { type: integer }
+
+    ConnectionRequest:
+      type: object
+      properties:
+        callback_url: { type: string, format: uri, description: "Your https webhook address (any path, no query, public host)." }
+        remove_callback: { type: boolean }
+        expected_agent_email: { type: string, description: "Comparison only; it never selects an agent." }
+
+    ConnectionResult:
+      allOf:
+        - { $ref: "#/components/schemas/Ping" }
+        - type: object
+          properties:
+            agent_match: { type: [boolean, "null"] }
+            callback_result:
+              type: [object, "null"]
+              properties:
+                state: { type: string, enum: [verified, rejected, unreachable, failed, removed] }
+                message: { type: string }
+
+    Category:
+      type: object
+      required: [id, name, slug]
+      properties:
+        id: { type: integer }
+        name: { type: string }
+        slug: { type: string }
+        parent: { type: integer }
+        count: { type: integer }
+
+    CategoryList:
+      type: object
+      required: [items, total]
+      properties:
+        items: { type: array, items: { $ref: "#/components/schemas/Category" } }
+        total: { type: integer }
+
+    Variation:
+      type: object
+      required: [id]
+      properties:
+        id: { type: integer, description: "Send as `rk_variation_id`." }
+        sku: { type: string }
+        price: { type: string }
+        regular_price: { type: string }
+        base_price: { type: string, description: "What you pay ResellingKori per unit." }
+        purchasable: { type: boolean }
+        stock_status: { type: string, enum: [instock, outofstock, onbackorder] }
+        stock_quantity: { type: [integer, "null"] }
+        attributes: { type: object, additionalProperties: { type: string } }
+        label: { type: string }
+        image: { type: string }
+        weight: { type: string }
+
+    Product:
+      type: object
+      required: [id, name, sku, type, base_price, purchasable, stock_status]
+      properties:
+        id: { type: integer, description: "Send as `rk_product_id`." }
+        name: { type: string }
+        sku: { type: string }
+        type: { type: string, enum: [simple, variable] }
+        price: { type: string, description: "ResellingKori's current shop price (reference only; you choose your own price)." }
+        regular_price: { type: string }
+        base_price: { type: string, description: "**What you pay ResellingKori per unit.** Your selling price must not be lower. Empty when the product has no price." }
+        purchasable: { type: boolean }
+        stock_status: { type: string, enum: [instock, outofstock, onbackorder] }
+        stock_quantity: { type: [integer, "null"], description: "`null` when stock is not counted." }
+        image: { type: string }
+        permalink: { type: string }
+        matched_variation_id: { type: integer }
+        categories:
+          type: array
+          items: { $ref: "#/components/schemas/Category" }
+        images: { type: array, items: { type: string } }
+        short_description: { type: string }
+        description: { type: string, description: "HTML; only with `include=description`." }
+        weight: { type: string }
+        dimensions:
+          type: object
+          properties:
+            length: { type: string }
+            width: { type: string }
+            height: { type: string }
+        date_modified: { type: string, description: "ISO 8601, UTC. Use it for incremental sync." }
+        variations: { type: array, items: { $ref: "#/components/schemas/Variation" } }
+
+    ProductPage:
+      type: object
+      required: [items, page, per_page, total, total_pages, server_time]
+      properties:
+        items: { type: array, items: { $ref: "#/components/schemas/Product" } }
+        page: { type: integer }
+        per_page: { type: integer }
+        total: { type: integer }
+        total_pages: { type: integer }
+        server_time: { type: integer }
+
+    SearchResult:
+      type: object
+      required: [items, total]
+      properties:
+        items: { type: array, items: { $ref: "#/components/schemas/Product" } }
+        total: { type: integer }
+
+    SkuResult:
+      type: object
+      required: [matches, not_found]
+      properties:
+        matches:
+          description: SKU → product (an empty list when nothing matched).
+          oneOf:
+            - { type: array, maxItems: 0 }
+            - { type: object, additionalProperties: { $ref: "#/components/schemas/Product" } }
+        not_found: { type: array, items: { type: string } }
+
+    Customer:
+      type: object
+      required: [name, phone, address_1]
+      properties:
+        name: { type: string, maxLength: 120 }
+        phone: { type: string, description: "10–15 digits after removing everything except digits and `+`." }
+        email: { type: string }
+        address_1: { type: string, maxLength: 255 }
+        address_2: { type: string, maxLength: 255 }
+        city: { type: string, maxLength: 100 }
+        state: { type: string, maxLength: 100 }
+        postcode: { type: string, maxLength: 20 }
+        country: { type: string, default: BD }
+
+    OrderItem:
+      type: object
+      required: [external_item_id, rk_product_id, quantity, selling_unit_price]
+      properties:
+        external_item_id: { type: integer, minimum: 1, description: "Unique within the order (your line number is fine)." }
+        rk_product_id: { type: integer, minimum: 1 }
+        rk_variation_id: { type: integer, minimum: 0, description: "Required for variable products, otherwise 0." }
+        sku: { type: string, description: Informational. }
+        name: { type: string, description: Informational. }
+        quantity: { type: integer, minimum: 1, maximum: 999 }
+        selling_unit_price: { $ref: "#/components/schemas/Money" }
+        expected_base_unit_price:
+          allOf:
+            - { $ref: "#/components/schemas/Money" }
+          description: "Optional guard: the `base_price` you showed your customer. Never used as the price; if ResellingKori's price changed the order is refused with `409 rkapi_price_changed`."
+
+    Payment:
+      type: object
+      required: [method, delivery_charge, prepaid_amount, cod_amount]
+      description: |
+        `cod_amount = order_total − prepaid_amount`, where `order_total = Σ selling_unit_price × quantity + delivery_charge`.
+        Method `prepaid`: `prepaid_amount = order_total` and `cod_amount = 0`. You always send all three amounts.
+      properties:
+        method: { type: string, enum: [cod, prepaid] }
+        delivery_charge: { $ref: "#/components/schemas/Money" }
+        prepaid_amount: { $ref: "#/components/schemas/Money" }
+        cod_amount: { $ref: "#/components/schemas/Money" }
+
+    OrderRequest:
+      type: object
+      required: [schema, external_order_id, currency, customer, items, payment]
+      properties:
+        schema: { type: integer, const: 2 }
+        external_order_id: { $ref: "#/components/schemas/ExternalOrderId" }
+        external_order_number: { type: string, maxLength: 64 }
+        currency: { type: string, const: BDT }
+        partial: { type: boolean, description: "`true` if the parcel contains only part of your customer's order (information only)." }
+        customer: { $ref: "#/components/schemas/Customer" }
+        items:
+          type: array
+          minItems: 1
+          maxItems: 50
+          items: { $ref: "#/components/schemas/OrderItem" }
+        payment: { $ref: "#/components/schemas/Payment" }
+        note: { type: string, maxLength: 500 }
+      description: "Fields you might be tempted to send are ignored on purpose: store, agent, key, ResellingKori price, tax, discount, order status."
+
+    Financials:
+      type: object
+      required: [currency, base_total, selling_total, profit_total, delivery_charge, order_total, prepaid_amount, cod_amount]
+      properties:
+        currency: { type: string, examples: [BDT] }
+        base_total: { $ref: "#/components/schemas/Money" }
+        selling_total: { $ref: "#/components/schemas/Money" }
+        profit_total: { $ref: "#/components/schemas/Money" }
+        delivery_charge: { $ref: "#/components/schemas/Money" }
+        order_total: { $ref: "#/components/schemas/Money" }
+        prepaid_amount: { $ref: "#/components/schemas/Money" }
+        cod_amount: { $ref: "#/components/schemas/Money" }
+
+    Tracking:
+      type: object
+      properties:
+        courier: { type: string }
+        number: { type: string }
+        url: { type: string }
+
+    Order:
+      type: object
+      required: [id, external_order_id, status, sequence, financials, cancellable]
+      properties:
+        id: { type: integer, description: ResellingKori order id. }
+        number: { type: string }
+        external_order_id: { $ref: "#/components/schemas/ExternalOrderId" }
+        status: { $ref: "#/components/schemas/OrderStatus" }
+        raw_status: { type: string, description: "ResellingKori's own status (informational; do not branch on it)." }
+        tracking: { $ref: "#/components/schemas/Tracking" }
+        updated_at: { type: string, description: ISO 8601 UTC. }
+        sequence: { type: integer, description: "Grows with every change you can observe; never apply an older sequence over a newer one." }
+        partial: { type: boolean }
+        items:
+          type: array
+          items:
+            type: object
+            properties:
+              external_item_id: { type: integer }
+              quantity: { type: integer }
+        financials: { $ref: "#/components/schemas/Financials" }
+        cancellable: { type: boolean }
+        error: { type: string, description: "Set when ResellingKori needs your attention (for example the courier could not reach the customer)." }
+
+    CreateResult:
+      type: object
+      required: [order, duplicate]
+      properties:
+        order: { $ref: "#/components/schemas/Order" }
+        duplicate: { type: boolean }
+
+    ValidateResult:
+      type: object
+      required: [valid, financials, lines]
+      properties:
+        valid: { type: boolean }
+        financials: { $ref: "#/components/schemas/Financials" }
+        lines:
+          type: array
+          items:
+            type: object
+            properties:
+              external_item_id: { type: integer }
+              rk_product_id: { type: integer }
+              rk_variation_id: { type: integer }
+              name: { type: string }
+              quantity: { type: integer }
+              selling_unit_price: { $ref: "#/components/schemas/Money" }
+              base_unit_price: { $ref: "#/components/schemas/Money" }
+              line_profit: { type: string }
+              stock_available: { type: [integer, "null"] }
+        existing_order:
+          type: [object, "null"]
+          description: Tells you when the reference was already used.
+          properties:
+            state: { type: string }
+            order_id: { type: integer }
+            same_content: { type: boolean }
+        message: { type: string }
+
+    LookupResult:
+      type: object
+      required: [order, state]
+      properties:
+        order:
+          oneOf:
+            - { $ref: "#/components/schemas/Order" }
+            - { type: "null" }
+        state: { type: string, enum: [created, cancelled, creating] }
+
+    StatusResult:
+      type: object
+      required: [orders, not_found]
+      properties:
+        orders: { type: array, items: { $ref: "#/components/schemas/Order" } }
+        not_found: { type: array, items: { type: integer } }
+
+    OrderPage:
+      type: object
+      required: [orders, page, per_page, total, total_pages, server_time]
+      properties:
+        orders: { type: array, items: { $ref: "#/components/schemas/Order" } }
+        gone: { type: array, items: { type: string } }
+        page: { type: integer }
+        per_page: { type: integer }
+        total: { type: integer }
+        total_pages: { type: integer }
+        server_time: { type: integer }
+
+    CancelRequest:
+      type: object
+      required: [external_order_id]
+      properties:
+        external_order_id: { $ref: "#/components/schemas/ExternalOrderId" }
+        reason: { type: string, maxLength: 200 }
+
+    CancelResult:
+      type: object
+      required: [order, already_cancelled]
+      properties:
+        order: { $ref: "#/components/schemas/Order" }
+        already_cancelled: { type: boolean }
+
+    WebhookEvent:
+      type: object
+      required: [id, type, created, api_version, store_id]
+      properties:
+        id: { type: string, examples: [evt_0123456789abcdef01234567] }
+        type:
+          type: string
+          description: "Unknown types mean \"the order changed\": use `data.order` as the truth."
+          examples: [order.shipped]
+          enum:
+            - callback.verify
+            - order.accepted
+            - order.pending
+            - order.processing
+            - order.on_hold
+            - order.shipped
+            - order.delivered
+            - order.cancelled
+            - order.returned
+            - order.tracking_updated
+            - order.courier_updated
+            - order.error
+        created: { type: integer }
+        api_version: { type: string, examples: ["1"] }
+        store_id: { type: string }
+        sequence: { type: integer }
+        challenge: { type: string, description: "Only in `callback.verify`." }
+        data:
+          type: object
+          properties:
+            order: { $ref: "#/components/schemas/Order" }
